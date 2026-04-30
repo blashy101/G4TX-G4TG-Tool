@@ -14,7 +14,7 @@ def read_g4tx_info(g4tx):
 
     header_size = struct.unpack_from("<H", g4tx, 0x04)[0]
     table_size = struct.unpack_from("<I", g4tx, 0x0C)[0]
-    texture_data_size = struct.unpack_from("<I", g4tx, 0x30)[0]
+    texture_data_size = struct.unpack_from("<I", g4tx, 0x2C)[0]
 
     data_base = align_up(header_size + table_size, 0x10)
 
@@ -49,11 +49,7 @@ def extract_gnf(g4tx_path, g4tg_path, out_path):
 
     Path(out_path).write_bytes(gnf)
 
-    print(f"Extracted: {out_path}")
-    print(f"G4TX GNF offset: 0x{info['gnf_offset']:X}")
-    print(f"GNF stub size:   0x{info['gnf_stub_size']:X}")
-    print(f"G4TG body size:  0x{len(g4tg):X}")
-    print(f"Output GNF size: 0x{len(gnf):X}")
+    print(f"[OK] Extracted: {out_path}")
 
 
 def rebuild_pair(original_g4tx_path, edited_gnf_path, out_g4tx_path, out_g4tg_path):
@@ -70,7 +66,7 @@ def rebuild_pair(original_g4tx_path, edited_gnf_path, out_g4tx_path, out_g4tg_pa
 
     if new_stub_size != old_stub_size:
         raise ValueError(
-            f"Edited GNF stub size changed: old 0x{old_stub_size:X}, new 0x{new_stub_size:X}. "
+            f"Edited GNF stub size changed: old 0x{old_stub_size:X}, new 0x{new_stub_size:X}."
         )
 
     stub = gnf[:new_stub_size]
@@ -81,11 +77,37 @@ def rebuild_pair(original_g4tx_path, edited_gnf_path, out_g4tx_path, out_g4tg_pa
     Path(out_g4tx_path).write_bytes(g4tx)
     Path(out_g4tg_path).write_bytes(body)
 
-    print(f"Rebuilt G4TX: {out_g4tx_path}")
-    print(f"Rebuilt G4TG: {out_g4tg_path}")
-    print(f"GNF stub size: 0x{new_stub_size:X}")
-    print(f"G4TG body size: 0x{len(body):X}")
-    print(f"Full GNF size:  0x{len(gnf):X}")
+    print(f"[OK] Rebuilt: {out_g4tx_path} + {out_g4tg_path}")
+
+
+def batch_extract(root_dir):
+    root = Path(root_dir)
+
+    g4tx_files = list(root.rglob("*.g4tx"))
+
+    if not g4tx_files:
+        print("No .g4tx files found.")
+        return
+
+    count = 0
+
+    for g4tx_path in g4tx_files:
+        base = g4tx_path.with_suffix("")
+        g4tg_path = base.with_suffix(".g4tg")
+
+        if not g4tg_path.exists():
+            print(f"[SKIP] Missing .g4tg for: {g4tx_path}")
+            continue
+
+        out_path = base.with_suffix(".gnf")
+
+        try:
+            extract_gnf(g4tx_path, g4tg_path, out_path)
+            count += 1
+        except Exception as e:
+            print(f"[ERROR] {g4tx_path}: {e}")
+
+    print(f"\nDone. Extracted {count} file(s).")
 
 
 def main():
@@ -105,12 +127,17 @@ def main():
     rb.add_argument("out_g4tx")
     rb.add_argument("out_g4tg")
 
+    bx = sub.add_parser("batch_extract", help="Batch extracts GNF from current directory/subdirectories.")
+    bx.add_argument("folder", nargs="?", default=".", help="Root folder (default: current directory)")
+
     args = parser.parse_args()
 
     if args.cmd == "extract":
         extract_gnf(args.g4tx, args.g4tg, args.out_gnf)
     elif args.cmd == "rebuild":
         rebuild_pair(args.original_g4tx, args.edited_gnf, args.out_g4tx, args.out_g4tg)
+    elif args.cmd == "batch_extract":
+        batch_extract(args.folder)
 
 
 if __name__ == "__main__":
