@@ -6,7 +6,7 @@ This tool handles all the GNF steps in memory so you just deal with the .g4tx/.g
 
 Implements deswizzling and dimension calculation logic from https://gitgud.io/veiledmerc/freegnm 
 
-When editing .DDS texture file, re-export it using the same compression format (BC7/BC3/BC1), without changing resolution or mipmaps! 
+When editing .DDS texture file, re-export it using the same compression format as the original image (BC7/BC3/BC1/Uncompressed), without changing resolution or mipmaps! 
 
 __________________________________________________________________________________________________________________________________________________________
 
