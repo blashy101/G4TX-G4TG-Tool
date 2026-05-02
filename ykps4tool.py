@@ -16,6 +16,7 @@ def align_up(value, align):
     return (value + align - 1) & ~(align - 1)
 
 DXGI_FORMAT = {
+    "RGBA8": 28,
     "BC1": 70,
     "BC3": 77,
     "BC7": 98,
@@ -29,6 +30,7 @@ BC_BLOCK_SIZE = {
 }
 
 GNM_SURFACE_FORMAT = {
+    0x0A: ("RGBA8", DXGI_FORMAT["RGBA8"]),
     0x23: ("BC1", DXGI_FORMAT["BC1"]),
     0x25: ("BC3", DXGI_FORMAT["BC3"]),
     0x29: ("BC7", DXGI_FORMAT["BC7"]),
@@ -74,7 +76,39 @@ def write_dds_dx10(filename, width, height, mipcount, raw_data, dxgi_format):
         f.write(dx10)
         f.write(raw_data)
 
-def read_dds_dx10(path):
+def write_dds_rgba8(filename, width, height, mipcount, raw_data):
+    header = bytearray(128)
+
+    header[0:4] = b"DDS "
+    struct.pack_into("<I", header, 4, 124)
+
+    # DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT
+    struct.pack_into("<I", header, 8, 0x0000100F)
+
+    struct.pack_into("<I", header, 12, height)
+    struct.pack_into("<I", header, 16, width)
+    struct.pack_into("<I", header, 20, width * 4)
+    struct.pack_into("<I", header, 24, 1)
+    struct.pack_into("<I", header, 28, mipcount)
+
+    # DDS_PIXELFORMAT
+    struct.pack_into("<I", header, 76, 32)
+    struct.pack_into("<I", header, 80, 0x41)  # DDPF_RGB | DDPF_ALPHAPIXELS
+    struct.pack_into("<I", header, 88, 32)
+
+    # Raw data layout is RGBA8.
+    struct.pack_into("<I", header, 92, 0x000000FF)
+    struct.pack_into("<I", header, 96, 0x0000FF00)
+    struct.pack_into("<I", header, 100, 0x00FF0000)
+    struct.pack_into("<I", header, 104, 0xFF000000)
+
+    struct.pack_into("<I", header, 108, 0x1000)
+
+    with open(filename, "wb") as f:
+        f.write(header)
+        f.write(raw_data)
+
+def read_dds(path):
     data = Path(path).read_bytes()
 
     if data[:4] != b"DDS ":
@@ -84,13 +118,31 @@ def read_dds_dx10(path):
     width = u32(data, 16)
     mipcount = u32(data, 28)
 
-    if data[84:88] != b"DX10":
-        raise ValueError("Only DX10 DDS files are supported")
+    fourcc = data[84:88]
 
-    dxgi = u32(data, 128)
-    payload = data[148:]
+    if fourcc == b"DX10":
+        dxgi = u32(data, 128)
+        payload = data[148:]
+        return width, height, mipcount, dxgi, payload
 
-    return width, height, mipcount, dxgi, payload
+    pf_flags = u32(data, 80)
+    rgb_bit_count = u32(data, 88)
+    r_mask = u32(data, 92)
+    g_mask = u32(data, 96)
+    b_mask = u32(data, 100)
+    a_mask = u32(data, 104)
+
+    if (
+        (pf_flags & 0x40)
+        and rgb_bit_count == 32
+        and r_mask == 0x000000FF
+        and g_mask == 0x0000FF00
+        and b_mask == 0x00FF0000
+        and a_mask == 0xFF000000
+    ):
+        return width, height, mipcount, DXGI_FORMAT["RGBA8"], data[128:]
+
+    raise ValueError("Unsupported DDS format. Expected DX10 BC DDS or legacy RGBA8 DDS.")
 
 def compute_pixel_index_thin_micro(x, y):
     x0 = (x >> 0) & 1
@@ -163,6 +215,44 @@ def swizzle_bc_1d_thin(linear_data, width, height, pitch_pixels, block_bytes, sw
 
             if src_off + block_bytes <= len(linear_data) and dst_off + block_bytes <= len(out):
                 out[dst_off:dst_off + block_bytes] = linear_data[src_off:src_off + block_bytes]
+
+    return bytes(out)
+
+def deswizzle_rgba8_1d_thin(data, width, height, pitch_pixels):
+    bpp = 32
+    bytes_per_pixel = 4
+
+    src_pitch = align_up(pitch_pixels, 8)
+    src_height = align_up(height, 8)
+
+    out = bytearray(width * height * bytes_per_pixel)
+
+    for y in range(height):
+        for x in range(width):
+            src_off = compute_microtiled_addr_1d_thin(x, y, bpp, src_pitch, src_height)
+            dst_off = (y * width + x) * bytes_per_pixel
+
+            if src_off + bytes_per_pixel <= len(data):
+                out[dst_off:dst_off + bytes_per_pixel] = data[src_off:src_off + bytes_per_pixel]
+
+    return bytes(out)
+
+def swizzle_rgba8_1d_thin(linear_data, width, height, pitch_pixels, swizzled_size):
+    bpp = 32
+    bytes_per_pixel = 4
+
+    dst_pitch = align_up(pitch_pixels, 8)
+    dst_height = align_up(height, 8)
+
+    out = bytearray(swizzled_size)
+
+    for y in range(height):
+        for x in range(width):
+            src_off = (y * width + x) * bytes_per_pixel
+            dst_off = compute_microtiled_addr_1d_thin(x, y, bpp, dst_pitch, dst_height)
+
+            if src_off + bytes_per_pixel <= len(linear_data) and dst_off + bytes_per_pixel <= len(out):
+                out[dst_off:dst_off + bytes_per_pixel] = linear_data[src_off:src_off + bytes_per_pixel]
 
     return bytes(out)
 
@@ -374,13 +464,23 @@ def extract_g4tx_pair(path):
                 tex["pitch"],
                 BC_BLOCK_SIZE[label],
             )
+        elif label == "RGBA8" and tex["tiling"] == 13:
+            raw_out = deswizzle_rgba8_1d_thin(
+                raw,
+                tex["width"],
+                tex["height"],
+                tex["pitch"],
+            )
         else:
             raw_out = raw
 
         filename = output_dds_name(path, i, label, names, used_names)
         out_path = path.parent / filename
 
-        write_dds_dx10(out_path, tex["width"], tex["height"], tex["mips"], raw_out, dxgi)
+        if label == "RGBA8":
+            write_dds_rgba8(out_path, tex["width"], tex["height"], tex["mips"], raw_out)
+        else:
+            write_dds_dx10(out_path, tex["width"], tex["height"], tex["mips"], raw_out, dxgi)
 
         print(f"  -> {out_path}")
 
@@ -396,7 +496,7 @@ def validate_dds_for_texture(g4tx_path, tex, index):
         return False, warnings, errors
 
     try:
-        width, height, mipcount, dds_dxgi, linear_payload = read_dds_dx10(dds_path)
+        width, height, mipcount, dds_dxgi, linear_payload = read_dds(dds_path)
     except Exception as e:
         errors.append(f"Could not read DDS: {e}")
         return True, warnings, errors
@@ -412,7 +512,7 @@ def validate_dds_for_texture(g4tx_path, tex, index):
     if mipcount != tex["mips"]:
         errors.append(f"Mip count mismatch: DDS {mipcount}, expected {tex['mips']}")
 
-    if label not in BC_BLOCK_SIZE:
+    if label not in BC_BLOCK_SIZE and label != "RGBA8":
         errors.append(f"Unsupported import format: {label}")
 
     if tex["tiling"] != 13:
@@ -425,6 +525,14 @@ def validate_dds_for_texture(g4tx_path, tex, index):
             ((tex["height"] + 3) // 4) *
             block_bytes
         )
+
+        if len(linear_payload) != expected_linear_size:
+            errors.append(
+                f"Payload size mismatch: DDS 0x{len(linear_payload):X}, expected 0x{expected_linear_size:X}"
+            )
+
+    elif label == "RGBA8":
+        expected_linear_size = tex["width"] * tex["height"] * 4
 
         if len(linear_payload) != expected_linear_size:
             errors.append(
@@ -505,18 +613,29 @@ def import_textures_into_gnf_bytes(g4tx_path, gnf_bytes):
         if errors:
             raise ValueError(f"Texture {i}: validation failed: {'; '.join(errors)}")
 
-        width, height, mipcount, dds_dxgi, linear_payload = read_dds_dx10(dds_path)
+        width, height, mipcount, dds_dxgi, linear_payload = read_dds(dds_path)
 
-        block_bytes = BC_BLOCK_SIZE[label]
+        if label in BC_BLOCK_SIZE:
+            block_bytes = BC_BLOCK_SIZE[label]
 
-        swizzled = swizzle_bc_1d_thin(
-            linear_payload,
-            tex["width"],
-            tex["height"],
-            tex["pitch"],
-            block_bytes,
-            tex["texture_size"],
-        )
+            swizzled = swizzle_bc_1d_thin(
+                linear_payload,
+                tex["width"],
+                tex["height"],
+                tex["pitch"],
+                block_bytes,
+                tex["texture_size"],
+            )
+        elif label == "RGBA8":
+            swizzled = swizzle_rgba8_1d_thin(
+                linear_payload,
+                tex["width"],
+                tex["height"],
+                tex["pitch"],
+                tex["texture_size"],
+            )
+        else:
+            raise ValueError(f"Texture {i}: unsupported import format {label}")
 
         file_offset = data_start + tex["data_offset"]
 
